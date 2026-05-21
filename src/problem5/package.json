@@ -1,0 +1,20 @@
+{
+  "name": "problem5-crude-server",
+  "version": "1.0.0",
+  "description": "A crude CRUD server built with ExpressJS and TypeScript",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node --experimental-sqlite dist/index.js",
+    "dev": "ts-node --require ts-node/register src/index.ts"
+  },
+  "dependencies": {
+    "express": "^4.18.2"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.21",
+    "@types/node": "^20.11.5",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.3.3"
+  }
+}
