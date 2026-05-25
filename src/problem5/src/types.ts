@@ -22,6 +22,6 @@ export interface ScoreFilter {
   username?: string;
   min_score?: number;
   max_score?: number;
-  limit?: number;
-  offset?: number;
+  limit: number;
+  offset: number;
 }
