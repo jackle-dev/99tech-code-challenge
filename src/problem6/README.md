@@ -76,32 +76,65 @@ Authorization: Bearer <JWT>
 ## Execution Flow
 
 ```
-Client                   API Server               Database          WebSocket Hub
-  |                          |                        |                   |
-  |-- POST /scores/increment |                        |                   |
-  |   (JWT + action_id)      |                        |                   |
-  |                          |-- Verify JWT           |                   |
-  |                          |   extract user_id      |                   |
-  |                          |                        |                   |
-  |                          |-- Check action_id  --->|                   |
-  |                          |   not already used     |                   |
-  |                          |<-- OK / 409 Conflict --|                   |
-  |                          |                        |                   |
-  |                          |-- Mark action_id used->|                   |
-  |                          |-- UPDATE score      --->|                   |
-  |                          |<-- new_score -----------|                   |
-  |                          |                        |                   |
-  |<-- 200 { new_score } ----|                        |                   |
-  |                          |                        |                   |
-  |                          |-- Fetch top 10 ------->|                   |
-  |                          |<-- top 10 rows --------|                   |
-  |                          |                        |                   |
-  |                          |-- Broadcast update ----------------------->|
-  |                          |                        |    (top 10 JSON)  |
-  |                          |                        |                   |
-  |<============================= WS push (top 10) ======================|
-  |   (all connected clients)                                             |
+Client                   API Server              Redis                WebSocket Hub
+  |                          |                     |                       |
+  |-- POST /scores/increment |                     |                       |
+  |   (JWT + action_id)      |                     |                       |
+  |                          |-- Verify JWT        |                       |
+  |                          |   extract user_id   |                       |
+  |                          |                     |                       |
+  |                          |-- SET NX consumed_action:<id> EX 86400 ---->|
+  |                          |<-- OK / nil (409) --|                       |
+  |                          |                     |                       |
+  |                          |-- ZINCRBY leaderboard 10 <user_id> -------->|
+  |                          |<-- new_score -------|                       |
+  |                          |                     |                       |
+  |<-- 200 { new_score } ----|                     |                       |
+  |                          |                     |                       |
+  |                          |-- ZREVRANGE leaderboard 0 9 WITHSCORES ---->|
+  |                          |<-- top 10 entries --|                       |
+  |                          |                     |                       |
+  |                          |-- broadcast top 10 ----------------------->|
+  |                          |                     |    (all WS clients)   |
+  |<============================= WS push { type: "snapshot", scores } ===|
+  |   (all connected clients)                                              |
 ```
+
+---
+
+## Data Model (Redis)
+
+Redis is the primary store for live score data. It is purpose-built for sorted set operations and makes the top-N query O(log N + N) with no additional indexing.
+
+| Key pattern                      | Type        | Purpose                                      |
+|----------------------------------|-------------|----------------------------------------------|
+| `leaderboard`                    | Sorted Set  | Members = `user_id`, scores = cumulative score. `ZINCRBY` on write, `ZREVRANGE … WITHSCORES` on read. |
+| `user:<user_id>`                 | Hash        | Stores `username` for display in the leaderboard. |
+| `consumed_action:<action_id>`    | String + TTL| Replay prevention. Set atomically with `SET NX EX 86400`. Value = `user_id`. Expires after 24 h. |
+
+### Key Redis Commands
+
+| Operation            | Command                                              |
+|----------------------|------------------------------------------------------|
+| Increment score      | `ZINCRBY leaderboard 10 <user_id>`                  |
+| Read top 10          | `ZREVRANGE leaderboard 0 9 WITHSCORES`              |
+| Claim action ID      | `SET consumed_action:<id> <user_id> EX 86400 NX`   |
+| User score           | `ZSCORE leaderboard <user_id>`                      |
+| User rank            | `ZREVRANK leaderboard <user_id>`                    |
+
+> The `SET NX` (set-if-not-exists) call is atomic at the Redis level, eliminating the check-then-set race condition for replay prevention.
+
+---
+
+## WebSocket Live Update
+
+- Clients connect to `wss://<host>/ws/scoreboard` on page load.
+- The server maintains an in-memory set of active WebSocket connections (the **hub**).
+- After every successful score write:
+  1. Server fetches top 10 via `ZREVRANGE`.
+  2. Server broadcasts `{ type: "snapshot", scores: [...], updated_at }` to all open connections.
+- Clients that connect mid-session receive the **last cached snapshot** immediately so the board is never blank on load.
+- The hub stores the last snapshot in memory; new connections get it without a Redis round-trip.
 
 ---
 
@@ -109,56 +142,28 @@ Client                   API Server               Database          WebSocket Hu
 
 ### Authentication
 - All score-write endpoints require a valid **JWT** signed by the auth service.
-- The JWT contains `user_id` and `exp`. The server never trusts the client-supplied `user_id` — it is always extracted from the verified token.
+- The JWT contains `user_id`, `username`, and `exp`. The server never trusts the client-supplied `user_id` — it is always extracted from the verified token.
 
 ### Replay Attack Prevention
-- Each action generates a **unique `action_id`** (UUID v4) on the server side when the action is initiated.
-- The API server stores consumed `action_id` values in the database with a TTL.
-- A second `POST /scores/increment` with the same `action_id` returns `409 Conflict`.
-
-### Rate Limiting
-- Apply per-user rate limiting on `POST /scores/increment` (e.g., 60 req/min) to limit brute-force score pumping.
+- Each server-issued action generates a **unique `action_id`** (UUID v4).
+- On `POST /scores/increment`, the server atomically executes `SET consumed_action:<id> <user_id> EX 86400 NX`.
+  - `OK` → first use, proceed.
+  - `nil` → already consumed, return `409 Conflict`.
+- Keys expire automatically after 24 h, so Redis memory is bounded without a background job.
 
 ### Score Increment Validation
 - The server defines the **fixed increment value** per action type — the client never sends the increment amount. This prevents clients from sending arbitrary score deltas.
 
----
-
-## Live Update (WebSocket)
-
-- Clients connect to `wss://<host>/ws/scoreboard` on page load.
-- After any successful score update, the server fetches the top 10 and broadcasts the result to **all connected clients** via the WebSocket hub.
-- Clients that disconnect and reconnect receive the latest snapshot on connection.
+### Rate Limiting
+- Apply per-user rate limiting on `POST /scores/increment` (e.g., 60 req/min) to limit score-pumping attempts.
 
 ---
 
-## Data Schema
+## Scaling Considerations
 
-```sql
--- User scores
-CREATE TABLE scores (
-  user_id    TEXT PRIMARY KEY,
-  username   TEXT NOT NULL,
-  score      INTEGER NOT NULL DEFAULT 0,
-  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
-
--- Consumed action IDs (replay prevention)
-CREATE TABLE consumed_actions (
-  action_id  TEXT PRIMARY KEY,
-  user_id    TEXT NOT NULL,
-  consumed_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
-CREATE INDEX idx_consumed_at ON consumed_actions(consumed_at);
--- Periodically purge rows older than action TTL (e.g. 24h) via a background job
-```
-
----
-
-## Suggested Improvements
-
-1. **Cache the top-10 result** (e.g., Redis with 1s TTL) to avoid hitting the DB on every broadcast when concurrent actions arrive in bursts.
-2. **Separate the WebSocket hub** into its own service so the API server can scale horizontally without losing broadcast subscribers (use a pub/sub channel like Redis Pub/Sub).
-3. **Persist WebSocket state** — store the latest top-10 snapshot in cache so newly connected clients get it immediately without a DB query.
-4. **Audit log** — append each increment event (user_id, action_id, delta, timestamp) to an immutable log table for fraud investigation.
-5. **Action verification callback** — before accepting an increment, optionally call back to the action service to confirm the action is legitimately completed (defense-in-depth against stolen `action_id`s).
+| Concern | Approach |
+|---------|----------|
+| Multiple API server instances | Move the WebSocket hub to a **Redis Pub/Sub channel** (`PUBLISH`/`SUBSCRIBE`). Each instance subscribes and fans out to its local WS clients. The sorted set remains the single source of truth. |
+| Read traffic on `GET /scores/top` | Cache the serialized top-10 JSON in Redis (`SET top10_cache … EX 1`) with a 1-second TTL to avoid a sorted-set read on every HTTP request. |
+| Audit / fraud investigation | Append each increment event (user_id, action_id, delta, timestamp) to an immutable log (append-only Redis Stream or a database table) for after-the-fact analysis. |
+| Action verification depth | Optionally call back to the action service before accepting an increment, to confirm the action was legitimately completed (defense-in-depth against stolen `action_id`s). |
